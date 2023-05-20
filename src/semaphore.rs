@@ -160,7 +160,9 @@ pub struct Acquire<'a> {
     semaphore: &'a Semaphore,
 
     /// The listener waiting on the semaphore.
-    listener: Option<EventListener>,
+    ///
+    /// TODO: At the next breaking release, remove the `Pin<Box<>>` and make this type `!Unpin`.
+    listener: Option<Pin<Box<EventListener>>>,
 }
 
 impl fmt::Debug for Acquire<'_> {
@@ -203,7 +205,9 @@ pub struct AcquireArc {
     semaphore: Arc<Semaphore>,
 
     /// The listener waiting on the semaphore.
-    listener: Option<EventListener>,
+    ///
+    /// TODO: At the next breaking release, remove the `Pin<Box<>>` and make this type `!Unpin`.
+    listener: Option<Pin<Box<EventListener>>>,
 }
 
 impl fmt::Debug for AcquireArc {

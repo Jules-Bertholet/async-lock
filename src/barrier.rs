@@ -110,7 +110,11 @@ enum WaitState {
     Initial,
 
     /// We are waiting for the listener to complete.
-    Waiting { evl: EventListener, local_gen: u64 },
+    Waiting {
+        /// TODO: At the next breaking release, remove the `Pin<Box<>>` and make this type `!Unpin`.
+        evl: Pin<Box<EventListener>>,
+        local_gen: u64,
+    },
 
     /// Waiting to re-acquire the lock to check the state again.
     Reacquiring(u64),

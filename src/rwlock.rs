@@ -388,7 +388,9 @@ pub struct Read<'a, T: ?Sized> {
     state: usize,
 
     /// The listener for the "no writers" event.
-    listener: Option<EventListener>,
+    ///
+    /// TODO: At the next breaking release, remove the `Pin<Box<>>` and make this type `!Unpin`.
+    listener: Option<Pin<Box<EventListener>>>,
 }
 
 impl<T: ?Sized> fmt::Debug for Read<'_, T> {
@@ -525,7 +527,9 @@ enum WriteState<'a, T: ?Sized> {
         guard: Option<RwLockWriteGuard<'a, T>>,
 
         /// The listener for the "no readers" event.
-        listener: Option<EventListener>,
+        ///
+        /// TODO: At the next breaking release, remove the `Pin<Box<>>` and make this type `!Unpin`.
+        listener: Option<Pin<Box<EventListener>>>,
     },
 }
 
@@ -786,7 +790,9 @@ pub struct Upgrade<'a, T: ?Sized> {
     guard: Option<RwLockWriteGuard<'a, T>>,
 
     /// The event listener we are waiting on.
-    listener: Option<EventListener>,
+    ///
+    /// TODO: At the next breaking release, remove the `Pin<Box<>>` and make this type `!Unpin`.
+    listener: Option<Pin<Box<EventListener>>>,
 }
 
 impl<T: ?Sized> fmt::Debug for Upgrade<'_, T> {

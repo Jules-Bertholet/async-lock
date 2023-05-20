@@ -1,7 +1,6 @@
 use std::borrow::Borrow;
 use std::cell::UnsafeCell;
 use std::fmt;
-use std::future::Future;
 use std::marker::PhantomData;
 use std::mem;
 use std::ops::{Deref, DerefMut};
@@ -9,7 +8,7 @@ use std::pin::Pin;
 use std::process;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::task::{Context, Poll};
+use std::task::Poll;
 
 // Note: we cannot use `target_family = "wasm"` here because it requires Rust 1.54.
 #[cfg(not(any(target_arch = "wasm32", target_arch = "wasm64")))]
@@ -18,6 +17,7 @@ use std::time::{Duration, Instant};
 use std::usize;
 
 use event_listener::{Event, EventListener};
+use event_listener_strategy::{easy_wrapper, EventListenerFuture};
 
 /// An async mutex.
 ///
@@ -109,10 +109,10 @@ impl<T: ?Sized> Mutex<T> {
     /// ```
     #[inline]
     pub fn lock(&self) -> Lock<'_, T> {
-        Lock {
+        Lock::_new(LockInner {
             mutex: self,
             acquire_slow: None,
-        }
+        })
     }
 
     /// Attempts to acquire the mutex.
@@ -184,7 +184,7 @@ impl<T: ?Sized> Mutex<T> {
     /// ```
     #[inline]
     pub fn lock_arc(self: &Arc<Self>) -> LockArc<T> {
-        LockArc(LockArcInnards::Unpolled(self.clone()))
+        LockArc::_new(LockArcInnards::Unpolled(self.clone()))
     }
 
     /// Attempts to acquire the mutex and clone a reference to it.
@@ -246,8 +246,13 @@ impl<T: Default + ?Sized> Default for Mutex<T> {
     }
 }
 
-/// The future returned by [`Mutex::lock`].
-pub struct Lock<'a, T: ?Sized> {
+easy_wrapper! {
+    /// The future returned by [`Mutex::lock`].
+    pub struct Lock<'a, T: ?Sized>(LockInner<'a, T> => MutexGuard<'a, T>);
+    pub(crate) wait();
+}
+
+struct LockInner<'a, T: ?Sized> {
     /// Reference to the mutex.
     mutex: &'a Mutex<T>,
 
@@ -255,45 +260,48 @@ pub struct Lock<'a, T: ?Sized> {
     acquire_slow: Option<AcquireSlow<&'a Mutex<T>, T>>,
 }
 
-impl<'a, T: ?Sized> Unpin for Lock<'a, T> {}
+impl<'a, T: ?Sized> Unpin for LockInner<'a, T> {}
 
-impl<T: ?Sized> fmt::Debug for Lock<'_, T> {
+impl<T: ?Sized> fmt::Debug for LockInner<'_, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("Lock { .. }")
     }
 }
 
-impl<'a, T: ?Sized> Future for Lock<'a, T> {
+impl<'a, T: ?Sized> EventListenerFuture for LockInner<'a, T> {
     type Output = MutexGuard<'a, T>;
 
     #[inline]
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.get_mut();
+    fn poll_with_strategy<'x, S: event_listener_strategy::Strategy<'x>>(
+        self: Pin<&'x mut Self>,
+        strategy: &mut S,
+        context: &mut S::Context,
+    ) -> Poll<Self::Output> {
+        let LockInner {
+            mutex,
+            acquire_slow,
+        } = self.get_mut();
 
-        loop {
-            match this.acquire_slow.as_mut() {
+        // This may seem weird, but the borrow checker complains otherwise.
+        if acquire_slow.is_none() {
+            match mutex.try_lock() {
+                Some(guard) => return Poll::Ready(guard),
                 None => {
-                    // Try the fast path before trying to register slowly.
-                    match this.mutex.try_lock() {
-                        Some(guard) => return Poll::Ready(guard),
-                        None => {
-                            this.acquire_slow = Some(AcquireSlow::new(this.mutex));
-                        }
-                    }
-                }
-
-                Some(acquire_slow) => {
-                    // Continue registering slowly.
-                    let value = ready!(Pin::new(acquire_slow).poll(cx));
-                    return Poll::Ready(MutexGuard(value));
+                    *acquire_slow = Some(AcquireSlow::new(mutex));
                 }
             }
         }
+
+        ready!(Pin::new(acquire_slow.as_mut().unwrap()).poll_with_strategy(strategy, context));
+        Poll::Ready(MutexGuard(mutex))
     }
 }
 
-/// The future returned by [`Mutex::lock_arc`].
-pub struct LockArc<T: ?Sized>(LockArcInnards<T>);
+easy_wrapper! {
+    /// The future returned by [`Mutex::lock_arc`].
+    pub struct LockArc<T: ?Sized>(LockArcInnards<T> => MutexGuardArc<T>);
+    pub(crate) wait();
+}
 
 enum LockArcInnards<T: ?Sized> {
     /// We have not tried to poll the fast path yet.
@@ -301,52 +309,48 @@ enum LockArcInnards<T: ?Sized> {
 
     /// We are acquiring the mutex through the slow path.
     AcquireSlow(AcquireSlow<Arc<Mutex<T>>, T>),
-
-    /// Empty hole to make taking easier.
-    Empty,
 }
 
-impl<T: ?Sized> Unpin for LockArc<T> {}
+impl<T: ?Sized> Unpin for LockArcInnards<T> {}
 
-impl<T: ?Sized> fmt::Debug for LockArc<T> {
+impl<T: ?Sized> fmt::Debug for LockArcInnards<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("LockArc { .. }")
     }
 }
 
-impl<T: ?Sized> Future for LockArc<T> {
+impl<T: ?Sized> EventListenerFuture for LockArcInnards<T> {
     type Output = MutexGuardArc<T>;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+    fn poll_with_strategy<'a, S: event_listener_strategy::Strategy<'a>>(
+        self: Pin<&'a mut Self>,
+        strategy: &mut S,
+        context: &mut S::Context,
+    ) -> Poll<Self::Output> {
         let this = self.get_mut();
 
         loop {
-            match mem::replace(&mut this.0, LockArcInnards::Empty) {
+            match this {
                 LockArcInnards::Unpolled(mutex) => {
                     // Try the fast path before trying to register slowly.
                     match mutex.try_lock_arc() {
                         Some(guard) => return Poll::Ready(guard),
                         None => {
-                            *this = LockArc(LockArcInnards::AcquireSlow(AcquireSlow::new(
-                                mutex.clone(),
-                            )));
+                            *this = LockArcInnards::AcquireSlow(AcquireSlow::new(mutex.clone()));
                         }
                     }
                 }
 
-                LockArcInnards::AcquireSlow(mut acquire_slow) => {
+                LockArcInnards::AcquireSlow(ref mut acquire_slow) => {
                     // Continue registering slowly.
-                    let value = match Pin::new(&mut acquire_slow).poll(cx) {
+                    let value = match Pin::new(acquire_slow).poll_with_strategy(strategy, context) {
                         Poll::Pending => {
-                            *this = LockArc(LockArcInnards::AcquireSlow(acquire_slow));
                             return Poll::Pending;
                         }
                         Poll::Ready(value) => value,
                     };
                     return Poll::Ready(MutexGuardArc(value));
                 }
-
-                LockArcInnards::Empty => panic!("future polled after completion"),
             }
         }
     }
@@ -358,7 +362,9 @@ struct AcquireSlow<B: Borrow<Mutex<T>>, T: ?Sized> {
     mutex: Option<B>,
 
     /// The event listener waiting on the mutex.
-    listener: Option<EventListener>,
+    ///
+    /// TODO: At the next breaking release, remove the `Pin<Box<>>` and make this type `!Unpin`.
+    listener: Option<Pin<Box<EventListener>>>,
 
     /// The point at which the mutex lock was started.
     #[cfg(not(any(target_arch = "wasm32", target_os = "wasm64")))]
@@ -402,11 +408,15 @@ impl<T: ?Sized, B: Borrow<Mutex<T>>> AcquireSlow<B, T> {
     }
 }
 
-impl<T: ?Sized, B: Unpin + Borrow<Mutex<T>>> Future for AcquireSlow<B, T> {
+impl<T: ?Sized, B: Unpin + Borrow<Mutex<T>>> EventListenerFuture for AcquireSlow<B, T> {
     type Output = B;
 
     #[cold]
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+    fn poll_with_strategy<'a, S: event_listener_strategy::Strategy<'a>>(
+        mut self: Pin<&'a mut Self>,
+        strategy: &mut S,
+        context: &mut S::Context,
+    ) -> Poll<Self::Output> {
         let this = &mut *self;
         #[cfg(not(any(target_arch = "wasm32", target_arch = "wasm64")))]
         let start = *this.start.get_or_insert_with(Instant::now);
@@ -443,7 +453,7 @@ impl<T: ?Sized, B: Unpin + Borrow<Mutex<T>>> Future for AcquireSlow<B, T> {
                     }
                     Some(ref mut listener) => {
                         // Wait for a notification.
-                        ready!(Pin::new(listener).poll(cx));
+                        ready!(strategy.poll(listener.as_mut(), context));
                         this.listener = None;
 
                         // Try locking if nobody is being starved.
@@ -515,7 +525,7 @@ impl<T: ?Sized, B: Unpin + Borrow<Mutex<T>>> Future for AcquireSlow<B, T> {
                 }
                 Some(ref mut listener) => {
                     // Wait for a notification.
-                    ready!(Pin::new(listener).poll(cx));
+                    ready!(strategy.poll(listener.as_mut(), context));
                     this.listener = None;
 
                     // Try acquiring the lock without waiting for others.
