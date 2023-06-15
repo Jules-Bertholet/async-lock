@@ -203,7 +203,7 @@ impl RawRwLock {
     #[inline]
 
     pub(super) unsafe fn downgrade_upgradable_read(&self) {
-        self.mutex.unlock_unchecked();
+        self.mutex.raw.unlock_unchecked();
     }
 
     /// # Safety
@@ -217,7 +217,7 @@ impl RawRwLock {
             .fetch_add(ONE_READER - WRITER_BIT, Ordering::SeqCst);
 
         // Release the writer mutex.
-        self.mutex.unlock_unchecked();
+        self.mutex.raw.unlock_unchecked();
 
         // Trigger the "no writer" event.
         self.no_writer.notify(1);
@@ -260,7 +260,7 @@ impl RawRwLock {
         }
 
         // SAFETY: upgradable read guards acquire the writer mutex upon creation.
-        self.mutex.unlock_unchecked();
+        self.mutex.raw.unlock_unchecked();
     }
 
     /// # Safety
@@ -276,7 +276,7 @@ impl RawRwLock {
 
         // Release the writer lock.
         // SAFETY: `RwLockWriteGuard` always holds a lock on writer mutex.
-        self.mutex.unlock_unchecked();
+        self.mutex.raw.unlock_unchecked();
     }
 }
 

@@ -19,6 +19,43 @@ use std::usize;
 
 use event_listener::{Event, EventListener};
 
+/// The inner locking implementation of a mutex, holds no data.
+pub(crate) struct RawMutex {
+    /// Current state of the mutex.
+    ///
+    /// The least significant bit is set to 1 if the mutex is locked.
+    /// The other bits hold the number of starved lock operations.
+    state: AtomicUsize,
+
+    /// Lock operations waiting for the mutex to be released.
+    lock_ops: Event,
+}
+
+impl RawMutex {
+    #[must_use]
+    #[inline]
+    const fn new() -> Self {
+        RawMutex {
+            state: AtomicUsize::new(0),
+            lock_ops: Event::new(),
+        }
+    }
+
+    /// Unlocks the mutex directly.
+    ///
+    /// # Safety
+    ///
+    /// This function is intended to be used only in the case where the mutex is locked,
+    /// and the guard is subsequently forgotten. Calling this while you don't hold a lock
+    /// on the mutex will likely lead to UB.
+    #[inline]
+    pub(crate) unsafe fn unlock_unchecked(&self) {
+        // Remove the last bit and notify a waiting lock operation.
+        self.state.fetch_sub(1, Ordering::Release);
+        self.lock_ops.notify(1);
+    }
+}
+
 /// An async mutex.
 ///
 /// The locking mechanism uses eventual fairness to ensure locking will be fair on average without
@@ -42,14 +79,7 @@ use event_listener::{Event, EventListener};
 /// # })
 /// ```
 pub struct Mutex<T: ?Sized> {
-    /// Current state of the mutex.
-    ///
-    /// The least significant bit is set to 1 if the mutex is locked.
-    /// The other bits hold the number of starved lock operations.
-    state: AtomicUsize,
-
-    /// Lock operations waiting for the mutex to be released.
-    lock_ops: Event,
+    pub(crate) raw: RawMutex,
 
     /// The value inside the mutex.
     data: UnsafeCell<T>,
@@ -68,10 +98,11 @@ impl<T> Mutex<T> {
     ///
     /// let mutex = Mutex::new(0);
     /// ```
+    #[must_use]
+    #[inline]
     pub const fn new(data: T) -> Mutex<T> {
         Mutex {
-            state: AtomicUsize::new(0),
-            lock_ops: Event::new(),
+            raw: RawMutex::new(),
             data: UnsafeCell::new(data),
         }
     }
@@ -86,6 +117,8 @@ impl<T> Mutex<T> {
     /// let mutex = Mutex::new(10);
     /// assert_eq!(mutex.into_inner(), 10);
     /// ```
+    #[must_use]
+    #[inline]
     pub fn into_inner(self) -> T {
         self.data.into_inner()
     }
@@ -107,6 +140,7 @@ impl<T: ?Sized> Mutex<T> {
     /// assert_eq!(*guard, 10);
     /// # })
     /// ```
+    #[must_use]
     #[inline]
     pub fn lock(&self) -> Lock<'_, T> {
         Lock {
@@ -134,6 +168,7 @@ impl<T: ?Sized> Mutex<T> {
     #[inline]
     pub fn try_lock(&self) -> Option<MutexGuard<'_, T>> {
         if self
+            .raw
             .state
             .compare_exchange(0, 1, Ordering::Acquire, Ordering::Acquire)
             .is_ok()
@@ -160,21 +195,10 @@ impl<T: ?Sized> Mutex<T> {
     /// assert_eq!(*mutex.lock().await, 10);
     /// # })
     /// ```
+    #[must_use]
+    #[inline]
     pub fn get_mut(&mut self) -> &mut T {
         unsafe { &mut *self.data.get() }
-    }
-
-    /// Unlocks the mutex directly.
-    ///
-    /// # Safety
-    ///
-    /// This function is intended to be used only in the case where the mutex is locked,
-    /// and the guard is subsequently forgotten. Calling this while you don't hold a lock
-    /// on the mutex will likely lead to UB.
-    pub(crate) unsafe fn unlock_unchecked(&self) {
-        // Remove the last bit and notify a waiting lock operation.
-        self.state.fetch_sub(1, Ordering::Release);
-        self.lock_ops.notify(1);
     }
 }
 
@@ -195,6 +219,7 @@ impl<T: ?Sized> Mutex<T> {
     /// assert_eq!(*guard, 10);
     /// # })
     /// ```
+    #[must_use]
     #[inline]
     pub fn lock_arc(self: &Arc<Self>) -> LockArc<T> {
         LockArc(LockArcInnards::Unpolled(self.clone()))
@@ -220,6 +245,7 @@ impl<T: ?Sized> Mutex<T> {
     #[inline]
     pub fn try_lock_arc(self: &Arc<Self>) -> Option<MutexGuardArc<T>> {
         if self
+            .raw
             .state
             .compare_exchange(0, 1, Ordering::Acquire, Ordering::Acquire)
             .is_ok()
@@ -235,6 +261,7 @@ impl<T: fmt::Debug + ?Sized> fmt::Debug for Mutex<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         struct Locked;
         impl fmt::Debug for Locked {
+            #[inline]
             fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                 f.write_str("<locked>")
             }
@@ -248,12 +275,14 @@ impl<T: fmt::Debug + ?Sized> fmt::Debug for Mutex<T> {
 }
 
 impl<T> From<T> for Mutex<T> {
+    #[inline]
     fn from(val: T) -> Mutex<T> {
         Mutex::new(val)
     }
 }
 
 impl<T: Default + ?Sized> Default for Mutex<T> {
+    #[inline]
     fn default() -> Mutex<T> {
         Mutex::new(Default::default())
     }
@@ -274,6 +303,7 @@ unsafe impl<T: Sync + ?Sized> Sync for Lock<'_, T> {}
 impl<'a, T: ?Sized> Unpin for Lock<'a, T> {}
 
 impl<T: ?Sized> fmt::Debug for Lock<'_, T> {
+    #[inline]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("Lock { .. }")
     }
@@ -328,6 +358,7 @@ unsafe impl<T: Sync + ?Sized> Sync for LockArc<T> {}
 impl<T: ?Sized> Unpin for LockArc<T> {}
 
 impl<T: ?Sized> fmt::Debug for LockArc<T> {
+    #[inline]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("LockArc { .. }")
     }
@@ -394,6 +425,7 @@ impl<B: Borrow<Mutex<T>> + Unpin, T: ?Sized> Unpin for AcquireSlow<B, T> {}
 
 impl<T: ?Sized, B: Borrow<Mutex<T>>> AcquireSlow<B, T> {
     /// Create a new `AcquireSlow` future.
+    #[must_use]
     #[cold]
     fn new(mutex: B) -> Self {
         AcquireSlow {
@@ -413,7 +445,7 @@ impl<T: ?Sized, B: Borrow<Mutex<T>>> AcquireSlow<B, T> {
         if self.starved {
             if let Some(mutex) = mutex.as_ref() {
                 // Decrement this counter before we exit.
-                mutex.borrow().state.fetch_sub(2, Ordering::Release);
+                mutex.borrow().raw.state.fetch_sub(2, Ordering::Release);
             }
         }
 
@@ -442,10 +474,11 @@ impl<T: ?Sized, B: Unpin + Borrow<Mutex<T>>> Future for AcquireSlow<B, T> {
                 match &mut this.listener {
                     None => {
                         // Start listening for events.
-                        this.listener = Some(mutex.lock_ops.listen());
+                        this.listener = Some(mutex.raw.lock_ops.listen());
 
                         // Try locking if nobody is being starved.
                         match mutex
+                            .raw
                             .state
                             .compare_exchange(0, 1, Ordering::Acquire, Ordering::Acquire)
                             .unwrap_or_else(|x| x)
@@ -467,6 +500,7 @@ impl<T: ?Sized, B: Unpin + Borrow<Mutex<T>>> Future for AcquireSlow<B, T> {
 
                         // Try locking if nobody is being starved.
                         match mutex
+                            .raw
                             .state
                             .compare_exchange(0, 1, Ordering::Acquire, Ordering::Acquire)
                             .unwrap_or_else(|x| x)
@@ -481,7 +515,7 @@ impl<T: ?Sized, B: Unpin + Borrow<Mutex<T>>> Future for AcquireSlow<B, T> {
                             _ => {
                                 // Notify the first listener in line because we probably received a
                                 // notification that was meant for a starved task.
-                                mutex.lock_ops.notify(1);
+                                mutex.raw.lock_ops.notify(1);
                                 break;
                             }
                         }
@@ -497,7 +531,7 @@ impl<T: ?Sized, B: Unpin + Borrow<Mutex<T>>> Future for AcquireSlow<B, T> {
             }
 
             // Increment the number of starved lock operations.
-            if mutex.state.fetch_add(2, Ordering::Release) > usize::MAX / 2 {
+            if mutex.raw.state.fetch_add(2, Ordering::Release) > usize::MAX / 2 {
                 // In case of potential overflow, abort.
                 process::abort();
             }
@@ -511,10 +545,11 @@ impl<T: ?Sized, B: Unpin + Borrow<Mutex<T>>> Future for AcquireSlow<B, T> {
             match &mut this.listener {
                 None => {
                     // Start listening for events.
-                    this.listener = Some(mutex.lock_ops.listen());
+                    this.listener = Some(mutex.raw.lock_ops.listen());
 
                     // Try locking if nobody else is being starved.
                     match mutex
+                        .raw
                         .state
                         .compare_exchange(2, 2 | 1, Ordering::Acquire, Ordering::Acquire)
                         .unwrap_or_else(|x| x)
@@ -528,7 +563,7 @@ impl<T: ?Sized, B: Unpin + Borrow<Mutex<T>>> Future for AcquireSlow<B, T> {
                         // Lock is available.
                         _ => {
                             // Be fair: notify the first listener and then go wait in line.
-                            mutex.lock_ops.notify(1);
+                            mutex.raw.lock_ops.notify(1);
                         }
                     }
                 }
@@ -538,7 +573,7 @@ impl<T: ?Sized, B: Unpin + Borrow<Mutex<T>>> Future for AcquireSlow<B, T> {
                     this.listener = None;
 
                     // Try acquiring the lock without waiting for others.
-                    if mutex.state.fetch_or(1, Ordering::Acquire) % 2 == 0 {
+                    if mutex.raw.state.fetch_or(1, Ordering::Acquire) % 2 == 0 {
                         return Poll::Ready(this.take_mutex().unwrap());
                     }
                 }
@@ -548,6 +583,7 @@ impl<T: ?Sized, B: Unpin + Borrow<Mutex<T>>> Future for AcquireSlow<B, T> {
 }
 
 impl<T: ?Sized, B: Borrow<Mutex<T>>> Drop for AcquireSlow<B, T> {
+    #[inline]
     fn drop(&mut self) {
         // Make sure the starvation counter is decremented.
         self.take_mutex();
@@ -575,6 +611,8 @@ impl<'a, T: ?Sized> MutexGuard<'a, T> {
     /// dbg!(MutexGuard::source(&guard));
     /// # })
     /// ```
+    #[must_use]
+    #[inline]
     pub fn source(guard: &MutexGuard<'a, T>) -> &'a Mutex<T> {
         guard.0
     }
@@ -585,18 +623,20 @@ impl<T: ?Sized> Drop for MutexGuard<'_, T> {
     fn drop(&mut self) {
         // SAFETY: we are dropping the mutex guard, therefore unlocking the mutex.
         unsafe {
-            self.0.unlock_unchecked();
+            self.0.raw.unlock_unchecked();
         }
     }
 }
 
 impl<T: fmt::Debug + ?Sized> fmt::Debug for MutexGuard<'_, T> {
+    #[inline]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Debug::fmt(&**self, f)
     }
 }
 
 impl<T: fmt::Display + ?Sized> fmt::Display for MutexGuard<'_, T> {
+    #[inline]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         (**self).fmt(f)
     }
@@ -605,12 +645,14 @@ impl<T: fmt::Display + ?Sized> fmt::Display for MutexGuard<'_, T> {
 impl<T: ?Sized> Deref for MutexGuard<'_, T> {
     type Target = T;
 
+    #[inline]
     fn deref(&self) -> &T {
         unsafe { &*self.0.data.get() }
     }
 }
 
 impl<T: ?Sized> DerefMut for MutexGuard<'_, T> {
+    #[inline]
     fn deref_mut(&mut self) -> &mut T {
         unsafe { &mut *self.0.data.get() }
     }
@@ -638,6 +680,8 @@ impl<T: ?Sized> MutexGuardArc<T> {
     /// dbg!(MutexGuardArc::source(&guard));
     /// # })
     /// ```
+    #[must_use]
+    #[inline]
     pub fn source(guard: &MutexGuardArc<T>) -> &Arc<Mutex<T>> {
         &guard.0
     }
@@ -648,18 +692,20 @@ impl<T: ?Sized> Drop for MutexGuardArc<T> {
     fn drop(&mut self) {
         // SAFETY: we are dropping the mutex guard, therefore unlocking the mutex.
         unsafe {
-            self.0.unlock_unchecked();
+            self.0.raw.unlock_unchecked();
         }
     }
 }
 
 impl<T: fmt::Debug + ?Sized> fmt::Debug for MutexGuardArc<T> {
+    #[inline]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Debug::fmt(&**self, f)
     }
 }
 
 impl<T: fmt::Display + ?Sized> fmt::Display for MutexGuardArc<T> {
+    #[inline]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         (**self).fmt(f)
     }
@@ -668,12 +714,14 @@ impl<T: fmt::Display + ?Sized> fmt::Display for MutexGuardArc<T> {
 impl<T: ?Sized> Deref for MutexGuardArc<T> {
     type Target = T;
 
+    #[inline]
     fn deref(&self) -> &T {
         unsafe { &*self.0.data.get() }
     }
 }
 
 impl<T: ?Sized> DerefMut for MutexGuardArc<T> {
+    #[inline]
     fn deref_mut(&mut self) -> &mut T {
         unsafe { &mut *self.0.data.get() }
     }
@@ -683,6 +731,7 @@ impl<T: ?Sized> DerefMut for MutexGuardArc<T> {
 struct CallOnDrop<F: Fn()>(F);
 
 impl<F: Fn()> Drop for CallOnDrop<F> {
+    #[inline]
     fn drop(&mut self) {
         (self.0)();
     }
