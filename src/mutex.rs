@@ -1,15 +1,15 @@
 use std::borrow::Borrow;
 use std::cell::UnsafeCell;
-use std::fmt;
 use std::future::Future;
 use std::marker::PhantomData;
-use std::mem;
+use std::mem::{self, ManuallyDrop};
 use std::ops::{Deref, DerefMut};
 use std::pin::Pin;
 use std::process;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::{fmt, ptr};
 
 // Note: we cannot use `target_family = "wasm"` here because it requires Rust 1.54.
 #[cfg(not(any(target_arch = "wasm32", target_arch = "wasm64")))]
@@ -616,6 +616,65 @@ impl<'a, T: ?Sized> MutexGuard<'a, T> {
     pub fn source(guard: &MutexGuard<'a, T>) -> &'a Mutex<T> {
         guard.0
     }
+
+    /// Makes a new [`MappedMutexGuard`] for a component of the locked data.
+    ///
+    /// ```
+    /// # futures_lite::future::block_on(async {
+    /// use async_lock::{Mutex, MutexGuard};
+    ///
+    /// let mutex = Mutex::new((10_i32, 7_u32));
+    /// let guard = mutex.lock().await;
+    /// let mapped = MutexGuard::map(guard, |(x, _)| x);
+    /// assert_eq!(*mapped, 10_i32);
+    /// # })
+    /// ```
+    #[must_use]
+    #[inline]
+    pub fn map<U: ?Sized, F>(mut guard: Self, f: F) -> MappedMutexGuard<'a, U>
+    where
+        F: FnOnce(&mut T) -> &mut U,
+    {
+        let ptr: *mut U = f(&mut *guard);
+
+        let guard = ManuallyDrop::new(guard);
+
+        MappedMutexGuard {
+            mutex: &guard.0.raw,
+            data: ptr,
+        }
+    }
+
+    /// Attempt to make a new [`MappedMutexGuard`] for a component of the locked data.
+    /// The original guard is returned if the closure returns `None`.
+    ///
+    /// ```
+    /// # futures_lite::future::block_on(async {
+    /// use async_lock::{Mutex, MutexGuard};
+    ///
+    /// let mutex = Mutex::new(Some(42_i32));
+    /// let guard = mutex.lock().await;
+    /// let mapped = MutexGuard::try_map(guard, |x| x.as_mut()).unwrap();
+    /// assert_eq!(*mapped, 42);
+    /// # })
+    /// ```
+    #[inline]
+    pub fn try_map<U: ?Sized, F>(mut guard: Self, f: F) -> Result<MappedMutexGuard<'a, U>, Self>
+    where
+        F: FnOnce(&mut T) -> Option<&mut U>,
+    {
+        let ptr: *mut U = match f(&mut *guard) {
+            Some(ptr) => ptr,
+            None => return Err(guard),
+        };
+
+        let guard = ManuallyDrop::new(guard);
+
+        Ok(MappedMutexGuard {
+            mutex: &guard.0.raw,
+            data: ptr,
+        })
+    }
 }
 
 impl<T: ?Sized> Drop for MutexGuard<'_, T> {
@@ -658,6 +717,131 @@ impl<T: ?Sized> DerefMut for MutexGuard<'_, T> {
     }
 }
 
+/// A guard providing access to a subfield of the locked data, that releases the mutex when dropped.
+#[clippy::has_significant_drop]
+pub struct MappedMutexGuard<'a, T: ?Sized> {
+    mutex: &'a RawMutex,
+    data: *mut T,
+}
+
+unsafe impl<T: Send + ?Sized> Send for MappedMutexGuard<'_, T> {}
+unsafe impl<T: Sync + ?Sized> Sync for MappedMutexGuard<'_, T> {}
+
+impl<'a, T: ?Sized> MappedMutexGuard<'a, T> {
+    /// Makes a new [`MappedMutexGuard`] for a component of the locked data.
+    ///
+    /// ```
+    /// # futures_lite::future::block_on(async {
+    /// use async_lock::{MappedMutexGuard, Mutex, MutexGuard};
+    ///
+    /// let mutex = Mutex::new(((10_i32, 9_i32), 7_u32));
+    /// let guard = mutex.lock().await;
+    /// let mapped = MutexGuard::map(guard, |(x, _)| x);
+    /// let mapped_again = MappedMutexGuard::map(mapped, |(x, _)| x);
+    /// assert_eq!(*mapped_again, 10_i32);
+    /// # })
+    /// ```
+    #[must_use]
+    #[inline]
+    pub fn map<U: ?Sized, F>(mut guard: Self, f: F) -> MappedMutexGuard<'a, U>
+    where
+        F: FnOnce(&mut T) -> &mut U,
+    {
+        let ptr: *mut U = f(&mut *guard);
+
+        let guard = ManuallyDrop::new(guard);
+
+        MappedMutexGuard {
+            mutex: guard.mutex,
+            data: ptr,
+        }
+    }
+
+    /// Attempt to make a new [`MappedMutexGuard`] for a component of the locked data.
+    /// The original guard is returned if the closure returns `None`.
+    ///
+    /// ```
+    /// # futures_lite::future::block_on(async {
+    /// use async_lock::{MappedMutexGuard, Mutex, MutexGuard};
+    ///
+    /// let mutex = Mutex::new(Some(Some(42_i32)));
+    /// let guard = mutex.lock().await;
+    /// let mapped = MutexGuard::try_map(guard, |x| x.as_mut()).unwrap();
+    /// let mapped_again = MappedMutexGuard::try_map(mapped, |x| x.as_mut()).unwrap();
+    /// assert_eq!(*mapped_again, 42);
+    /// # })
+    /// ```
+    #[inline]
+    pub fn try_map<U: ?Sized, F>(mut guard: Self, f: F) -> Result<MappedMutexGuard<'a, U>, Self>
+    where
+        F: FnOnce(&mut T) -> Option<&mut U>,
+    {
+        let ptr: *mut U = match f(&mut *guard) {
+            Some(ptr) => ptr,
+            None => return Err(guard),
+        };
+
+        let guard = ManuallyDrop::new(guard);
+
+        Ok(MappedMutexGuard {
+            mutex: guard.mutex,
+            data: ptr,
+        })
+    }
+}
+
+impl<T: ?Sized> Drop for MappedMutexGuard<'_, T> {
+    #[inline]
+    fn drop(&mut self) {
+        // SAFETY: we are dropping the mutex guard, therefore unlocking the mutex.
+        unsafe {
+            self.mutex.unlock_unchecked();
+        }
+    }
+}
+
+impl<T: fmt::Debug + ?Sized> fmt::Debug for MappedMutexGuard<'_, T> {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&**self, f)
+    }
+}
+
+impl<T: fmt::Display + ?Sized> fmt::Display for MappedMutexGuard<'_, T> {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        (**self).fmt(f)
+    }
+}
+
+impl<T: ?Sized> Deref for MappedMutexGuard<'_, T> {
+    type Target = T;
+
+    #[inline]
+    fn deref(&self) -> &T {
+        unsafe { &*self.data }
+    }
+}
+
+impl<T: ?Sized> DerefMut for MappedMutexGuard<'_, T> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut T {
+        unsafe { &mut *self.data }
+    }
+}
+
+impl<'a, T: ?Sized> From<MutexGuard<'a, T>> for MappedMutexGuard<'a, T> {
+    #[inline]
+    fn from(guard: MutexGuard<'a, T>) -> Self {
+        let guard = ManuallyDrop::new(guard);
+
+        MappedMutexGuard {
+            mutex: &guard.0.raw,
+            data: guard.0.data.get(),
+        }
+    }
+}
+
 /// An owned guard that releases the mutex when dropped.
 #[clippy::has_significant_drop]
 pub struct MutexGuardArc<T: ?Sized>(Arc<Mutex<T>>);
@@ -684,6 +868,71 @@ impl<T: ?Sized> MutexGuardArc<T> {
     #[inline]
     pub fn source(guard: &MutexGuardArc<T>) -> &Arc<Mutex<T>> {
         &guard.0
+    }
+
+    /// Consumes the lock (without dropping) and returns the underlying `Arc`.
+    #[inline]
+    fn into_arc(guard: Self) -> Arc<Mutex<T>> {
+        let guard = ManuallyDrop::new(guard);
+        // SAFETY: `guard` is not used after this
+        unsafe { ptr::read(&guard.0) }
+    }
+
+    /// Makes a new [`MappedMutexGuardArc`] for a component of the locked data.
+    ///
+    /// ```
+    /// # futures_lite::future::block_on(async {
+    /// use std::sync::Arc;
+    /// use async_lock::{Mutex, MutexGuardArc};
+    ///
+    /// let mutex = Arc::new(Mutex::new((10_i32, 7_u32)));
+    /// let guard = mutex.lock_arc().await;
+    /// let mapped = MutexGuardArc::map(guard, |(x, _)| x);
+    /// assert_eq!(*mapped, 10_i32);
+    /// # })
+    /// ```
+    #[must_use]
+    #[inline]
+    pub fn map<U: ?Sized, F>(mut guard: Self, f: F) -> MappedMutexGuardArc<U, T>
+    where
+        F: FnOnce(&mut T) -> &mut U,
+    {
+        let ptr: *mut U = f(&mut *guard);
+
+        MappedMutexGuardArc {
+            mutex: Self::into_arc(guard),
+            data: ptr,
+        }
+    }
+
+    /// Attempt to make a new [`MappedMutexGuardArc`] for a component of the locked data.
+    /// The original guard is returned if the closure returns `None`.
+    ///
+    /// ```
+    /// # futures_lite::future::block_on(async {
+    /// use std::sync::Arc;
+    /// use async_lock::{Mutex, MutexGuardArc};
+    ///
+    /// let mutex = Arc::new(Mutex::new(Some(42_i32)));
+    /// let guard = mutex.lock_arc().await;
+    /// let mapped = MutexGuardArc::try_map(guard, |x| x.as_mut()).unwrap();
+    /// assert_eq!(*mapped, 42);
+    /// # })
+    /// ```
+    #[inline]
+    pub fn try_map<U: ?Sized, F>(mut guard: Self, f: F) -> Result<MappedMutexGuardArc<U, T>, Self>
+    where
+        F: FnOnce(&mut T) -> Option<&mut U>,
+    {
+        let ptr: *mut U = match f(&mut *guard) {
+            Some(ptr) => ptr,
+            None => return Err(guard),
+        };
+
+        Ok(MappedMutexGuardArc {
+            mutex: Self::into_arc(guard),
+            data: ptr,
+        })
     }
 }
 
@@ -727,12 +976,131 @@ impl<T: ?Sized> DerefMut for MutexGuardArc<T> {
     }
 }
 
-/// Calls a function when dropped.
-struct CallOnDrop<F: Fn()>(F);
+/// A guard providing access to a subfield of the locked data, that releases the mutex when dropped.
+#[clippy::has_significant_drop]
+pub struct MappedMutexGuardArc<T: ?Sized, U: ?Sized = T> {
+    mutex: Arc<Mutex<U>>,
+    data: *mut T,
+}
 
-impl<F: Fn()> Drop for CallOnDrop<F> {
+unsafe impl<T: Send + ?Sized, U: Send + ?Sized> Send for MappedMutexGuardArc<T, U> {}
+unsafe impl<T: Send + Sync + ?Sized, U: Send + Sync + ?Sized> Sync for MappedMutexGuardArc<T, U> {}
+
+impl<T: ?Sized, U: ?Sized> MappedMutexGuardArc<T, U> {
+    /// Consumes the lock (without dropping) and returns the underlying `Arc`.
+    #[inline]
+    fn into_arc(guard: Self) -> Arc<Mutex<U>> {
+        let guard = ManuallyDrop::new(guard);
+        // SAFETY: `guard` is not used after this
+        unsafe { ptr::read(&guard.mutex) }
+    }
+
+    /// Makes a new [`MappedMutexGuardArc`] for a component of the locked data.
+    ///
+    /// ```
+    /// # futures_lite::future::block_on(async {
+    /// use std::sync::Arc;
+    /// use async_lock::{MappedMutexGuardArc, Mutex, MutexGuardArc};
+    ///
+    /// let mutex = Arc::new(Mutex::new(((10_i32, 9_i32), 7_u32)));
+    /// let guard = mutex.lock_arc().await;
+    /// let mapped = MutexGuardArc::map(guard, |(x, _)| x);
+    /// let mapped_again = MappedMutexGuardArc::map(mapped, |(x, _)| x);
+    /// assert_eq!(*mapped_again, 10_i32);
+    /// # })
+    /// ```
+    #[must_use]
+    #[inline]
+    pub fn map<V: ?Sized, F>(mut guard: Self, f: F) -> MappedMutexGuardArc<V, U>
+    where
+        F: FnOnce(&mut T) -> &mut V,
+    {
+        let ptr: *mut V = f(&mut *guard);
+
+        MappedMutexGuardArc {
+            mutex: Self::into_arc(guard),
+            data: ptr,
+        }
+    }
+
+    /// Attempt to make a new [`MappedMutexGuardArc`] for a component of the locked data.
+    /// The original guard is returned if the closure returns `None`.
+    ///
+    /// ```
+    /// # futures_lite::future::block_on(async {
+    /// use std::sync::Arc;
+    /// use async_lock::{MappedMutexGuardArc, Mutex, MutexGuardArc};
+    ///
+    /// let mutex = Arc::new(Mutex::new(Some(Some(42_i32))));
+    /// let guard = mutex.lock_arc().await;
+    /// let mapped = MutexGuardArc::try_map(guard, |x| x.as_mut()).unwrap();
+    /// let mapped_again = MappedMutexGuardArc::try_map(mapped, |x| x.as_mut()).unwrap();
+    /// assert_eq!(*mapped_again, 42);
+    /// # })
+    /// ```
+    #[inline]
+    pub fn try_map<V: ?Sized, F>(mut guard: Self, f: F) -> Result<MappedMutexGuardArc<V, U>, Self>
+    where
+        F: FnOnce(&mut T) -> Option<&mut V>,
+    {
+        let ptr: *mut V = match f(&mut *guard) {
+            Some(ptr) => ptr,
+            None => return Err(guard),
+        };
+
+        Ok(MappedMutexGuardArc {
+            mutex: Self::into_arc(guard),
+            data: ptr,
+        })
+    }
+}
+
+impl<T: ?Sized, U: ?Sized> Drop for MappedMutexGuardArc<T, U> {
     #[inline]
     fn drop(&mut self) {
-        (self.0)();
+        // SAFETY: we are dropping the mutex guard, therefore unlocking the mutex.
+        unsafe {
+            self.mutex.raw.unlock_unchecked();
+        }
+    }
+}
+
+impl<T: fmt::Debug + ?Sized, U: ?Sized> fmt::Debug for MappedMutexGuardArc<T, U> {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&**self, f)
+    }
+}
+
+impl<T: fmt::Display + ?Sized, U: ?Sized> fmt::Display for MappedMutexGuardArc<T, U> {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        (**self).fmt(f)
+    }
+}
+
+impl<T: ?Sized, U: ?Sized> Deref for MappedMutexGuardArc<T, U> {
+    type Target = T;
+
+    #[inline]
+    fn deref(&self) -> &T {
+        unsafe { &*self.data }
+    }
+}
+
+impl<T: ?Sized, U: ?Sized> DerefMut for MappedMutexGuardArc<T, U> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut T {
+        unsafe { &mut *self.data }
+    }
+}
+
+impl<T: ?Sized> From<MutexGuardArc<T>> for MappedMutexGuardArc<T> {
+    #[inline]
+    fn from(guard: MutexGuardArc<T>) -> Self {
+        MappedMutexGuardArc {
+            data: guard.0.data.get(),
+            mutex: MutexGuardArc::into_arc(guard),
+        }
     }
 }

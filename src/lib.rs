@@ -45,7 +45,7 @@ mod rwlock;
 mod semaphore;
 
 pub use barrier::{Barrier, BarrierWaitResult};
-pub use mutex::{Mutex, MutexGuard, MutexGuardArc};
+pub use mutex::{MappedMutexGuard, MappedMutexGuardArc, Mutex, MutexGuard, MutexGuardArc};
 pub use once_cell::OnceCell;
 pub use rwlock::{
     RwLock, RwLockReadGuard, RwLockReadGuardArc, RwLockUpgradableReadGuard,
